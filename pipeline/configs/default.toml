@@ -1,0 +1,66 @@
+# Full training run on Kaggle asl-signs. Every number in the README comes from
+# a run of this file: `uv run gesturesign prepare`, `train`, `evaluate`, `export`.
+name = "default"
+seed = 42
+
+# Decided by the browser landmark benchmark (pipeline/reports/bench.md): the Holistic
+# landmarker sustained 16.8 fps (median of 3 runs) under 4x CPU throttling,
+# above the 15 fps bar, so the browser runs Holistic and the model sees hands,
+# upper-body pose and 40 lip points. "hands_pose" is the fallback.
+feature_set = "hands_pose_lips"
+
+# asl-signs is recorded at about 30 fps; the browser resamples webcam frames to
+# `fps` from their timestamps.
+fps = 30
+source_fps = 30
+min_frames = 8
+max_frames = 64
+
+[split]
+# Signer-independent split by participant_id (21 signers in total). `prepare`
+# fails if any of these ids is missing from train.csv, and
+# `gesturesign participants` lists the ids and clip counts.
+test_participants = [16069, 37055, 61333]
+val_participants = [26734, 49445]
+
+[model]
+dim = 192
+depth = 3
+heads = 4
+conv_kernel = 17
+ff_mult = 2
+embedding_dim = 128
+dropout = 0.1
+cosine_scale = 16.0
+
+[train]
+# About 1.7 min per epoch on an M4 (MPS). The committed model's run stopped
+# early after 47 epochs (best validation top-1 at epoch 39), in about 80 min.
+batch_size = 128
+epochs = 50
+lr = 1e-3
+weight_decay = 0.05
+warmup_epochs = 2
+label_smoothing = 0.1
+patience = 8
+grad_clip = 1.0
+device = "auto"
+
+[augment]
+prob = 0.8
+rotate_deg = 15.0
+scale = 0.15
+aspect = 0.15
+shear = 0.1
+shift = 0.08
+time_stretch = 0.25
+frame_drop = 0.1
+hand_drop = 0.05
+
+[evaluate]
+ship_min_top1 = 0.60
+not_sure_precision = 0.80
+confusion_pairs = 20
+few_shot_ways = 8
+few_shot_shots = 3
+few_shot_episodes = 1000

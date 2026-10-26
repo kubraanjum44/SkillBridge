@@ -1,0 +1,149 @@
+"""``export-replay``: landmark clips for the web app's no-camera Replay mode.
+
+The browser reads ``web/public/replay/clips.json`` through one function,
+``loadReplayClips()``. Two sources write the same format:
+
+* ``synthetic`` (default): clips from this package's synthetic generator. They
+  are motion patterns, not real signs, and the page says so.
+* ``asl-signs`` (``gesturesign replay-clips``): about six real clips of shipped
+  signs from the held-out test signers. The Kaggle competition data is
+  CC BY 4.0, so a few landmark sequences can be redistributed with credit;
+  the page shows ``ASL_CREDIT`` next to every such clip.
+"""
+
+from __future__ import annotations
+
+import json
+import math
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+
+from gesturesign import landmarks as lm
+from gesturesign import synthetic
+from gesturesign.config import Config
+from gesturesign.data import load_sequence, open_source, read_train_csv
+from gesturesign.resample import fit_length, resample
+from gesturesign.signs import display_name, humanise_synthetic
+from gesturesign.types import Frames
+
+REPLAY_SEED = 31
+SYNTHETIC_NOTE = "Synthetic motion pattern made by the training pipeline, not a real sign."
+# The attribution wording the dataset credit asks for, en dash included.
+ASL_CREDIT = "Google – Isolated Sign Language Recognition (Kaggle, asl-signs), CC BY 4.0"  # noqa: RUF001
+ASL_NOTE = "Held-out signer: this person's clips were never used for training."
+SYNTHETIC_CREDIT = None
+
+
+def replay_points(cfg: Config) -> list[int]:
+    points = list(range(lm.LEFT_HAND_START, lm.N_POINTS))  # left hand, pose, right hand
+    if cfg.feature_set == "hands_pose_lips":
+        points = sorted(lm.LIPS) + points
+    return points
+
+
+def _encode(frames: Frames, points: list[int]) -> list[list[float | None]]:
+    out = []
+    for frame in frames[:, points, :2]:
+        flat = np.round(frame.astype(np.float64), 4).reshape(-1).tolist()
+        out.append([None if math.isnan(v) else v for v in flat])
+    return out
+
+
+def synthetic_clips(cfg: Config, n: int = 6) -> list[dict[str, Any]]:
+    rng = np.random.default_rng(REPLAY_SEED)
+    templates = synthetic.sign_templates(12, seed=REPLAY_SEED)
+    chosen = [templates[i] for i in (0, 1, 3, 4, 7, 9)][:n]
+    points = replay_points(cfg)
+    clips = []
+    for i, template in enumerate(chosen):
+        frames = synthetic.render_sign(
+            template, rng, T=48, left_handed=i == 1, jitter=0.002, dropout=0.0
+        )
+        frames = fit_length(resample(frames, cfg.source_fps, cfg.fps), cfg.max_frames)
+        clips.append(
+            {
+                "id": f"synthetic-{i + 1}",
+                "title": humanise_synthetic(template.name),
+                "sign": None,
+                "note": SYNTHETIC_NOTE + (" Left-handed signer." if i == 1 else ""),
+                "fps": cfg.fps,
+                "frames": _encode(frames, points),
+            }
+        )
+    return clips
+
+
+def shipped_signs(labels_path: Path) -> list[str] | None:
+    """Signs marked ``shipped`` in an exported labels.json (None if there is none yet)."""
+    if not labels_path.exists():
+        return None
+    labels = json.loads(labels_path.read_text(encoding="utf-8"))["signs"]
+    return [s["sign"] for s in labels if s["shipped"]]
+
+
+def asl_signs_clips(
+    cfg: Config,
+    data_dir: Path,
+    signs: list[str] | None,
+    n: int = 6,
+    *,
+    seed: int = REPLAY_SEED,
+    limit: int | None = None,
+) -> list[dict[str, Any]]:
+    """Up to ``n`` clips, one per sign, from the held-out test participants.
+
+    Prefers clips with enough frames to look like a sign and with the signing
+    hand visible in most of them, and spreads the picks across participants.
+    ``limit`` caps how many candidate clips are read.
+    """
+    source = open_source(data_dir)
+    table = read_train_csv(source)
+    table = table[table["participant_id"].isin(cfg.split.test_participants)]
+    if signs is not None:
+        table = table[table["sign"].isin(signs)]
+    rng = np.random.default_rng(seed)
+    order = rng.permutation(len(table))[: limit if limit else None]
+    points = replay_points(cfg)
+    clips: list[dict[str, Any]] = []
+    used_signs: set[str] = set()
+    per_participant: dict[int, int] = {}
+    for i in order:
+        if len(clips) >= n:
+            break
+        row = table.iloc[int(i)]
+        sign, pid = str(row["sign"]), int(row["participant_id"])
+        if sign in used_signs or per_participant.get(pid, 0) >= -(-n // 2):
+            continue
+        frames = load_sequence(source, str(row["path"]))
+        frames = fit_length(resample(frames, cfg.source_fps, cfg.fps), cfg.max_frames)
+        hands = np.isfinite(frames[:, [lm.LEFT_HAND_START, lm.RIGHT_HAND_START], 0]).any(axis=1)
+        if frames.shape[0] < 2 * cfg.min_frames or hands.mean() < 0.6:
+            continue
+        used_signs.add(sign)
+        per_participant[pid] = per_participant.get(pid, 0) + 1
+        clips.append(
+            {
+                "id": f"asl-{row['sequence_id']}",
+                "title": display_name(sign),
+                "sign": sign,
+                "note": ASL_NOTE,
+                "fps": cfg.fps,
+                "frames": _encode(frames, points),
+            }
+        )
+    return clips
+
+
+def write_replay(cfg: Config, clips: list[dict[str, Any]], source: str, path: Path) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "version": 1,
+        "source": source,
+        "credit": ASL_CREDIT if source == "asl-signs" else SYNTHETIC_CREDIT,
+        "points": replay_points(cfg),
+        "clips": clips,
+    }
+    path.write_text(json.dumps(payload, separators=(",", ":")) + "\n", encoding="utf-8")
+    return path
